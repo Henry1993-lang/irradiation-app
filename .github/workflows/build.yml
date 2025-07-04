@@ -30,4 +30,26 @@ jobs:
         with:
           name: IrradiationApp-${{ github.ref_name }}
           path: IrradiationApp.zip
+          # (この下に exe を圧縮したステップが既にあるはず)
+
+      - name: Create Source ZIP
+        run: |
+          7z a source.zip src\irradiation_app.py requirements.txt README.md
+          # ↑ Windows runner標準で 7zip利用可（GitHub提供のイメージに含む）
+
+      - name: Upload source ZIP as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Source-${{ github.ref_name }}
+          path: source.zip
+
+      # --- Release にも載せる場合 --------------------
+      - name: Upload source ZIP to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: source.zip
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 
