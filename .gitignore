@@ -1,1 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+# PyInstaller
+dist/
+build/
+*.spec
+# macOS
 .DS_Store
