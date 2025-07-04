@@ -1,9 +1,9 @@
 # .github/workflows/build.yml
 # ------------------------------------------------------------
-# タグ  vX.Y.Z  を push すると…
-#   1) Windows ランナーで PyInstaller ビルド
-#   2) IrradiationApp.zip（EXE）と Source.zip（.py + requirements）
-#   3) アーティファクト & GitHub Release へ自動アップロード
+# タグ vX.Y.Z を push すると
+#   1) Windows ランナーが PyInstaller で .exe を生成
+#   2) IrradiationApp.zip（EXE）と source.zip（.py＋requirements）
+#   3) アーティファクト & GitHub Release に自動アップロード
 # ------------------------------------------------------------
 
 name: Build Windows EXE & Source ZIP
@@ -11,93 +11,77 @@ name: Build Windows EXE & Source ZIP
 on:
   push:
     tags:
-      - "v*.*.*"           # 例: v1.0.0
+      - "v*.*.*"        # 例: v1.0.0
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      # --- 0. 取得 -------------------------------------------------------
-      - name: Checkout
-        uses: actions/checkout@v4
+    # 0. 取得 ----------------------------------------------------------------
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      # --- 1. Python 環境 ------------------------------------------------
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+    # 1. Python 環境 ----------------------------------------------------------
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
 
-      # --- 2. 依存＆PyInstaller ------------------------------------------
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+    # 2. 依存＋PyInstaller ----------------------------------------------------
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt pyinstaller
 
-      # --- 3. EXE ビルド -------------------------------------------------
-      - name: Build EXE
-        run: |
-          pyinstaller -F -w -n IrradiationApp src/irradiation_app.py
+    # 3. EXE ビルド ------------------------------------------------------------
+    - name: Build EXE with PyInstaller
+      run: |
+        pyinstaller -F -w -n IrradiationApp src/irradiation_app.py
 
-      # --- 4. ZIP を作成 (EXE / Source) ---------------------------------
-      - name: Package artifacts
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\IrradiationApp.exe -DestinationPath IrradiationApp.zip
-          7z a source.zip src\irradiation_app.py requirements.txt README.md
+    # 4. ZIP 作成（PowerShell Compress-Archive） ------------------------------
+    - name: Package artifacts
+      shell: pwsh
+      run: |
+        # dist/IrradiationApp.exe → IrradiationApp.zip
+        Compress-Archive -Path dist\IrradiationApp.exe `
+                         -DestinationPath IrradiationApp.zip `
+                         -Force
 
-      # --- 5. アーティファクトとして保存 -------------------------------
-      - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: IrradiationApp-${{ github.ref_name }}
-          path: IrradiationApp.zip
-          # (この下に exe を圧縮したステップが既にあるはず)
+        # ソース一式 → source.zip
+        Compress-Archive -Path src\irradiation_app.py, requirements.txt, README.md `
+                         -DestinationPath source.zip `
+                         -Force
 
-      - name: Create Source ZIP
-        run: |
-          7z a source.zip src\irradiation_app.py requirements.txt README.md
-          # ↑ Windows runner標準で 7zip利用可（GitHub提供のイメージに含む）
+    # 5. アーティファクトとして保持 ------------------------------------------
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: IrradiationApp-${{ github.ref_name }}
+        path: IrradiationApp.zip
 
-      - name: Upload source ZIP as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Source-${{ github.ref_name }}
-          path: source.zip
+    - name: Upload Source artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Source-${{ github.ref_name }}
+        path: source.zip
 
-      # --- Release にも載せる場合 --------------------
-      - name: Upload source ZIP to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: source.zip
-          tag_name: ${{ github.ref_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # 6. リリース作成 ----------------------------------------------------------
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: IrradiationApp ${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-
-      - name: Upload Source artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Source-${{ github.ref_name }}
-          path: source.zip
-
-      # --- 6. GitHub Release を作成 -------------------------------------
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: IrradiationApp ${{ github.ref_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # --- 7. ZIP を Release に添付 -------------------------------------
-      - name: Upload assets to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            IrradiationApp.zip
-            source.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+    # 7. ZIP を Release に添付 -------------------------------------------------
+    - name: Upload assets to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        files: |
+          IrradiationApp.zip
+          source.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
