@@ -1,23 +1,19 @@
 """
-irradiation_app.py  ― CSV(cp932) & Excel 対応 / Windows EXE 用
---------------------------------------------------------------
-* CSV は Shift-JIS 前提だが、区切り文字を自動推定
-* 区切り不一致行は on_bad_lines="skip" で読み飛ばし
+irradiation_app.py — 2025-07-10 delimiter-fallback 版
+-----------------------------------------------------
+* メタ行スキップ (日時, 行検出)
+* 区切り文字: Sniffer → ',' → '\t' の 3 段 fallback
 """
-
-import sys, math, logging
+import sys, math, logging, csv
 from pathlib import Path
-
 import pandas as pd
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QFileDialog, QVBoxLayout,
-    QHBoxLayout, QLabel, QPushButton, QComboBox, QGroupBox, QStatusBar,
-    QToolBar, QMessageBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QFileDialog, QComboBox, QGroupBox,
+    QToolBar, QStatusBar, QMessageBox,
 )
 
-# ---------------- 定数 ----------------
 SEARCH_KEY = "AI01C01"
 CONST_C = 100.0
 ISOTOPES = {"11C": 0.000566, "18F": 0.000105}
@@ -26,80 +22,19 @@ logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler("irradiation.log"), logging.StreamHandler()])
 
-# ============ バックグラウンドスレッド ============
+# ---------- CalcWorker ----------
 class CalcWorker(QThread):
-    finished = pyqtSignal(float, int, str)  # out_total, seconds, errorMsg
+    finished = pyqtSignal(float, int, str)
 
     def __init__(self, path: Path, l_const: float):
         super().__init__()
-        self.path = path
-        self.l_const = l_const
+        self.path, self.l_const = path, l_const
 
-    # ----------- 積算ロジック -----------
-    @staticmethod
-    def _irradiation(df: pd.DataFrame, l_const: float):
-        # 1) "AI01C01" のセルを探す
-        mask = df.apply(lambda col: col.astype(str).str.contains(SEARCH_KEY, na=False))
-        stacked = mask.stack()
-        if not stacked.any():
-            raise ValueError(f"'{SEARCH_KEY}' が見つかりません")
-        r_label, c_label = stacked.idxmax()
-        r = int(df.index.get_loc(r_label))
-        c = int(df.columns.get_loc(c_label))
-        start_row = r + 1
-
-        # 2) 列を数値化
-        df.iloc[:, c] = pd.to_numeric(df.iloc[:, c], errors="coerce")
-
-        # 3) 積算ループ
-        out_total, time_width, count, cur = 0.0, 0.0, 0, start_row
-        while cur < len(df):
-            val = df.iat[cur, c]
-            if pd.isna(val):
-                break
-            out_total *= math.exp(-l_const * time_width)
-            if val < 0.5:
-                cur += 1
-            else:
-                break
-        time_width = 1.0
-        while cur < len(df):
-            val = df.iat[cur, c]
-            if pd.isna(val) or val <= 0.3:
-                break
-            count += 1
-            out_total = (
-                out_total * math.exp(-l_const * time_width)
-                + CONST_C * val * (1 - math.exp(-l_const * time_width))
-            )
-            cur += 1
-
-        return round(out_total, 1), count
-
-    # ----------- run() -----------
+    # ---- main logic ----
     def run(self):
         try:
             if self.path.suffix.lower() == ".csv":
-                # --- 試行1: 区切り自動推定 ---
-                try:
-                    df = pd.read_csv(
-                        self.path,
-                        encoding="cp932",
-                        sep=None,
-                        engine="python",      # 自動Sniffer
-                        on_bad_lines="skip",  # 列数不整合行を無視
-                        skip_blank_lines=True,
-                    )
-                except Exception:
-                    # --- 試行2: タブ区切りを明示 ---
-                    df = pd.read_csv(
-                        self.path,
-                        encoding="cp932",
-                        sep="\t",
-                        engine="python",
-                        on_bad_lines="skip",
-                        skip_blank_lines=True,
-                    )
+                df = self._read_csv(self.path)
             else:
                 df = pd.read_excel(self.path, engine="openpyxl")
 
@@ -109,120 +44,138 @@ class CalcWorker(QThread):
             logging.exception("計算失敗")
             self.finished.emit(0.0, 0, str(e))
 
+    # ---- CSV 読み込み ----
+    @staticmethod
+    def _read_csv(path: Path) -> pd.DataFrame:
+        # 1) ヘッダ行 (「日時,」) を探す
+        header_row = 0
+        with open(path, "r", encoding="cp932", errors="ignore") as fh:
+            for n, line in enumerate(fh):
+                if line.lstrip().startswith("日時,"):
+                    header_row = n
+                    break
 
-# ============ メインウィンドウ ============
+        # 2) 区切り文字推定 → fallback
+        for sep_try in [None, ",", "\t"]:
+            try:
+                df = pd.read_csv(
+                    path,
+                    encoding="cp932",
+                    sep=sep_try,
+                    engine="python",
+                    header=header_row,
+                    on_bad_lines="skip",
+                    skip_blank_lines=True,
+                )
+            except Exception:
+                continue
+            # AI01C01 列があれば採用
+            if any(SEARCH_KEY in str(c) for c in df.columns):
+                return df
+
+        raise ValueError("区切り判定に失敗、または 'AI01C01' 列が見つかりません")
+
+    # ---- irradiation calc ----
+    @staticmethod
+    def _irradiation(df: pd.DataFrame, l_const: float):
+        # 列位置
+        try:
+            col_idx = next(i for i, c in enumerate(df.columns) if SEARCH_KEY in str(c))
+        except StopIteration:
+            raise ValueError(f"'{SEARCH_KEY}' 列が見つかりません")
+
+        # 数値化
+        df.iloc[:, col_idx] = pd.to_numeric(df.iloc[:, col_idx], errors="coerce")
+
+        start_row = 0
+        out_total = time_width = 0.0
+        cur = start_row
+        while cur < len(df):
+            v = df.iat[cur, col_idx]
+            if pd.isna(v):
+                break
+            out_total *= math.exp(-l_const * time_width)
+            if v < 0.5:
+                cur += 1
+            else:
+                break
+        time_width = 1.0
+        count = 0
+        while cur < len(df):
+            v = df.iat[cur, col_idx]
+            if pd.isna(v) or v <= 0.3:
+                break
+            count += 1
+            out_total = (
+                out_total * math.exp(-l_const * time_width)
+                + CONST_C * v * (1 - math.exp(-l_const * time_width))
+            )
+            cur += 1
+        return round(out_total, 1), count
+
+# ---------- GUI ----------
 class IrradiationWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("照射計算アプリ (CSV cp932 対応)")
+        self.setWindowTitle("照射計算アプリ")
         self.resize(640, 460)
-        self.setStyleSheet(self._dark())
         self.file_path: Path | None = None
         self.worker: CalcWorker | None = None
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        vbox = QVBoxLayout(central)
-        self._build_toolbar()
+        central = QWidget(); self.setCentralWidget(central)
+        v = QVBoxLayout(central); self.setStatusBar(QStatusBar())
 
-        # ---- ファイル選択 ----
-        grp_file = QGroupBox("データファイル選択")
-        h1 = QHBoxLayout()
-        self.btn_open = QPushButton("参照…")
-        self.btn_open.clicked.connect(self._open_file)
-        self.lbl_file = QLabel("<i>ファイル未選択</i>")
-        self.lbl_file.setWordWrap(True)
-        h1.addWidget(self.btn_open)
-        h1.addWidget(self.lbl_file)
-        grp_file.setLayout(h1)
-        vbox.addWidget(grp_file)
-
-        # ---- 同位体 ----
-        grp_iso = QGroupBox("同位体")
-        h2 = QHBoxLayout()
-        self.cmb_iso = QComboBox()
-        self.cmb_iso.addItems(ISOTOPES.keys())
-        h2.addWidget(self.cmb_iso)
-        grp_iso.setLayout(h2)
-        grp_iso.setEnabled(False)
-        self.grp_iso = grp_iso
-        vbox.addWidget(grp_iso)
-
-        # ---- 実行 ----
-        self.btn_start = QPushButton("計算実行")
-        self.btn_start.setEnabled(False)
-        self.btn_start.clicked.connect(self._run)
-        vbox.addWidget(self.btn_start)
-
-        # ---- 結果 ----
-        self.lbl_result = QLabel("<h2 align='center'>ここに結果が表示されます</h2>")
-        self.lbl_result.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        vbox.addWidget(self.lbl_result)
-
-        self.setStatusBar(QStatusBar())
-
-    # ---------- UI ヘルパ ----------
-    def _build_toolbar(self):
+        # toolbar
         tb = QToolBar()
-        act_open = QAction("開く", self)
-        act_open.triggered.connect(self._open_file)
-        act_exit = QAction("終了", self)
-        act_exit.triggered.connect(self.close)
-        tb.addAction(act_open)
-        tb.addSeparator()
-        tb.addAction(act_exit)
+        tb.addAction("開く", self._open)
+        tb.addSeparator(); tb.addAction("終了", self.close)
         self.addToolBar(tb)
 
-    @staticmethod
-    def _dark():
-        return (
-            "QWidget{background:#2b2b2b;color:#ddd;font-size:13px;}"
-            "QPushButton{background:#444;border:1px solid #666;padding:6px;border-radius:4px;}"
-            "QPushButton:hover{background:#555;}"
-            "QGroupBox{border:1px solid #666;margin-top:6px;}"
-            "QGroupBox::title{subcontrol-origin:margin;subcontrol-position:top center;padding:0 3px;}"
-        )
+        # file
+        g1 = QGroupBox("データファイル")
+        h1 = QHBoxLayout()
+        self.btn_open = QPushButton("参照…"); self.btn_open.clicked.connect(self._open)
+        self.lbl_file = QLabel("<i>未選択</i>")
+        h1.addWidget(self.btn_open); h1.addWidget(self.lbl_file)
+        g1.setLayout(h1); v.addWidget(g1)
 
-    # ---------- ファイル選択 ----------
-    def _open_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "CSV または Excel ファイルを開く",
-            str(Path.home()),
-            "Data files (*.csv *.xlsx *.xls)"
-        )
-        if not path:
-            return
-        self.file_path = Path(path)
-        self.lbl_file.setText(self.file_path.name)
-        self.grp_iso.setEnabled(True)
-        self.btn_start.setEnabled(True)
-        self.statusBar().showMessage("ファイルを選択しました", 3000)
+        # isotope
+        g2 = QGroupBox("同位体"); h2 = QHBoxLayout()
+        self.cmb_iso = QComboBox(); self.cmb_iso.addItems(ISOTOPES.keys())
+        h2.addWidget(self.cmb_iso); g2.setLayout(h2); g2.setEnabled(False)
+        self.grp_iso = g2; v.addWidget(g2)
 
-    # ---------- 計算 ----------
+        # run
+        self.btn_run = QPushButton("計算実行"); self.btn_run.setEnabled(False)
+        self.btn_run.clicked.connect(self._run); v.addWidget(self.btn_run)
+
+        # result
+        self.lbl_res = QLabel("<h2 align='center'>ここに結果</h2>")
+        self.lbl_res.setAlignment(Qt.AlignmentFlag.AlignCenter); v.addWidget(self.lbl_res)
+
+    def _open(self):
+        p, _ = QFileDialog.getOpenFileName(self, "CSV/Excel 選択", str(Path.home()),
+                                           "Data (*.csv *.xlsx *.xls)")
+        if p:
+            self.file_path = Path(p)
+            self.lbl_file.setText(self.file_path.name)
+            self.grp_iso.setEnabled(True); self.btn_run.setEnabled(True)
+
     def _run(self):
-        if not self.file_path:
-            return
         l_const = ISOTOPES[self.cmb_iso.currentText()]
-        self.btn_start.setEnabled(False)
+        self.btn_run.setEnabled(False)
         self.worker = CalcWorker(self.file_path, l_const)
-        self.worker.finished.connect(self._done)
-        self.worker.start()
+        self.worker.finished.connect(self._done); self.worker.start()
 
-    def _done(self, out_total: float, sec: int, err: str):
-        self.btn_start.setEnabled(True)
+    def _done(self, out_total, sec, err):
+        self.btn_run.setEnabled(True)
         if err:
-            QMessageBox.critical(self, "エラー", err)
-            return
+            QMessageBox.critical(self, "エラー", err); return
         m, s = divmod(sec, 60)
-        self.lbl_result.setText(
-            f"<h2 align='center'>照射時間: {m}分 {s}秒<br>{out_total} mCi</h2>"
-        )
-        self.statusBar().showMessage("完了", 3000)
+        self.lbl_res.setText(f"<h2 align='center'>照射: {m}分 {s}秒<br>{out_total} mCi</h2>")
 
-# ============ エントリポイント ============
+# ---------- main ----------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = IrradiationWindow()
-    win.show()
+    win = IrradiationWindow(); win.show()
     sys.exit(app.exec())
